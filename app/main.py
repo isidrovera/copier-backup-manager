@@ -26,6 +26,9 @@ DB_PATH = ROOT / 'state.sqlite3'
 LOCK = threading.Lock()
 SESSION_SECONDS = 12 * 3600
 TZ = ZoneInfo('America/Lima')
+INVENTORY_PATH = Path('/inventory/docker.json')
+MAX_INVENTORY_BYTES = 4 * 1024 * 1024
+INVENTORY_MAX_AGE_SECONDS = 24 * 3600
 app = FastAPI(title='Copier Backup Manager', docs_url=None, redoc_url=None)
 
 
@@ -192,6 +195,78 @@ def status(request: Request):
             'folder': get('folder', 'CopierBackupManager'), 'region': get('region', 'global'),
             'schedule': json.loads(get('schedule', '{"enabled":false,"hour":2,"minute":0,"retention_days":30}')),
             'runs': runs, 'busy': LOCK.locked(), 'recovery_key_saved': (ROOT / 'master.key').exists()}
+
+
+def read_docker_inventory():
+    """Read a fixed, agent-generated inventory. Never communicate with Docker.
+
+    An inventory is informational; it does not grant access to host paths,
+    mounted volumes or container workloads.
+    """
+    empty = {
+        'ready': False, 'stale': False, 'generated_at': None,
+        'containers': [], 'volumes': [], 'networks': [],
+        'images': [], 'compose_projects': [],
+    }
+    try:
+        if not INVENTORY_PATH.is_file() or INVENTORY_PATH.is_symlink():
+            return {**empty, 'message': 'El agente todavía no ha publicado su inventario'}
+        info = INVENTORY_PATH.stat()
+        if info.st_size <= 0 or info.st_size > MAX_INVENTORY_BYTES:
+            raise ValueError('El archivo de inventario está vacío o excede 4 MiB')
+        data = json.loads(INVENTORY_PATH.read_text(encoding='utf-8'))
+        if not isinstance(data, dict) or data.get('schema_version') != 1:
+            raise ValueError('Versión o formato de inventario no compatible')
+        names = ('containers', 'volumes', 'networks', 'images', 'compose_projects')
+        if any(not isinstance(data.get(name), list) for name in names):
+            raise ValueError('Inventario incompleto')
+        if any(len(data[name]) > 2000 for name in names):
+            raise ValueError('Inventario demasiado grande')
+        timestamp = data.get('generated_at')
+        if not isinstance(timestamp, str):
+            raise ValueError('Fecha de generación ausente')
+        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            raise ValueError('La fecha debe incluir zona horaria')
+        age = (datetime.now(timezone.utc) - dt).total_seconds()
+        if age < -300:
+            raise ValueError('El inventario tiene una fecha futura inválida')
+        # Ensure the payload cannot override the computed status or inject errors.
+        allowed = ('schema_version', 'generated_at', 'hostname', 'docker_version',
+                   'containers', 'volumes', 'networks', 'images', 'compose_projects', 'notice')
+        output = {key: data[key] for key in allowed if key in data}
+        stale = age > INVENTORY_MAX_AGE_SECONDS
+        return {
+            **output,
+            'ready': True,
+            'stale': stale,
+            'age_seconds': max(0, int(age)),
+            'message': 'El inventario necesita actualizarse' if stale else 'Inventario disponible',
+        }
+    except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        # This endpoint never reveals system paths or file contents on errors.
+        return {**empty, 'message': f'No se pudo validar el inventario: {type(exc).__name__}'}
+
+
+@app.get('/api/discovery')
+def discovery(request: Request):
+    require(request)
+    return read_docker_inventory()
+
+
+@app.get('/api/discovery/summary')
+def discovery_summary(request: Request):
+    require(request)
+    data = read_docker_inventory()
+    return {
+        'ready': data['ready'], 'stale': data['stale'],
+        'message': data['message'],
+        'hostname': data.get('hostname'),
+        'generated_at': data.get('generated_at'),
+        'docker_version': data.get('docker_version'),
+        'counts': {name: len(data[name]) for name in
+                   ('containers', 'volumes', 'networks', 'images', 'compose_projects')},
+    }
 
 
 @app.post('/api/sources')
