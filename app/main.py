@@ -6,6 +6,8 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import logging
 import secrets
 import sqlite3
 import subprocess
@@ -17,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 ROOT = Path(os.environ.get('CBM_DATA', '/data'))
@@ -25,6 +27,14 @@ SOURCE = Path(os.environ.get('CBM_SOURCES', '/sources'))
 DB_PATH = ROOT / 'state.sqlite3'
 LOCK = threading.Lock()
 SESSION_SECONDS = 12 * 3600
+LOG_RETENTION_DAYS = 30
+LOG_LIMIT = 10000
+LOGGER = logging.getLogger('cbm')
+if not LOGGER.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    LOGGER.addHandler(handler)
+LOGGER.setLevel(logging.INFO)
 TZ = ZoneInfo('America/Lima')
 INVENTORY_PATH = Path('/inventory/docker.json')
 MAX_INVENTORY_BYTES = 4 * 1024 * 1024
@@ -55,8 +65,85 @@ def init():
         CREATE TABLE IF NOT EXISTS config(name TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, csrf TEXT NOT NULL, expires INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY, operation TEXT NOT NULL, status TEXT NOT NULL, started TEXT NOT NULL, finished TEXT, detail TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS event_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT NOT NULL, level TEXT NOT NULL, component TEXT NOT NULL, message TEXT NOT NULL);
         ''')
     os.chmod(DB_PATH, 0o600)
+
+
+
+# Prevent accidental disclosure of pCloud OAuth tokens and common credentials.
+_SECRET_PATTERNS = [
+    re.compile(r'(?i)(access_token|refresh_token|password|authorization|secret|api[_-]?key)(\s*[=:]\s*)([^\s,;]+)'),
+    re.compile(r'(?i)(bearer\s+)[A-Za-z0-9._~+/-]{12,}'),
+]
+
+def safe_message(value):
+    msg = str(value or '').replace('\x00', '')[:1600]
+    for pattern in _SECRET_PATTERNS:
+        msg = pattern.sub(lambda m: m.group(1) + ('[REDACTED]' if m.lastindex == 1 else m.group(2) + '[REDACTED]'), msg)
+    # Avoid storing raw command output or user-supplied credentials in logs.
+    return msg
+
+def event(level, component, message):
+    level = level if level in ('INFO', 'WARNING', 'ERROR') else 'INFO'
+    component = re.sub(r'[^a-zA-Z0-9_-]', '', component)[:32] or 'app'
+    msg = safe_message(message)
+    getattr(LOGGER, 'warning' if level == 'WARNING' else level.lower())('%s: %s', component, msg)
+    try:
+        with db() as c:
+            c.execute('INSERT INTO event_logs(created, level, component, message) VALUES (?,?,?,?)', (now(), level, component, msg))
+            c.execute('DELETE FROM event_logs WHERE created < ?', ((datetime.now(timezone.utc)-timedelta(days=LOG_RETENTION_DAYS)).isoformat(timespec='seconds'),))
+            c.execute('DELETE FROM event_logs WHERE id IN (SELECT id FROM event_logs ORDER BY id DESC LIMIT -1 OFFSET ?)', (LOG_LIMIT,))
+    except sqlite3.Error:
+        LOGGER.exception('No se pudo registrar un evento')
+
+@app.get('/api/logs')
+def logs(request: Request, level: str = '', component: str = '', limit: int = 100):
+    require(request)
+    if level and level not in ('INFO', 'WARNING', 'ERROR'):
+        raise HTTPException(422, 'Nivel inválido')
+    if component and not re.fullmatch(r'[a-zA-Z0-9_-]{1,32}', component):
+        raise HTTPException(422, 'Componente inválido')
+    limit = max(1, min(limit, 500))
+    sql = 'SELECT id,created,level,component,message FROM event_logs WHERE 1=1'
+    params = []
+    if level:
+        sql += ' AND level=?'; params.append(level)
+    if component:
+        sql += ' AND component=?'; params.append(component)
+    sql += ' ORDER BY id DESC LIMIT ?'; params.append(limit)
+    with db() as c:
+        rows = [dict(x) for x in c.execute(sql, params)]
+    return {'items': rows, 'retention_days': LOG_RETENTION_DAYS}
+
+@app.get('/api/logs/export')
+def logs_export(request: Request):
+    require(request)
+    with db() as c:
+        rows = [dict(x) for x in c.execute('SELECT created,level,component,message FROM event_logs ORDER BY id DESC LIMIT 5000')]
+    payload = '\n'.join(json.dumps(x, ensure_ascii=False) for x in rows) + '\n'
+    return StreamingResponse(iter([payload.encode('utf-8')]), media_type='application/x-ndjson',
+                             headers={'Content-Disposition':'attachment; filename="cbm-events.jsonl"',
+                                      'Cache-Control':'no-store'})
+
+@app.get('/api/diagnostics')
+def diagnostics(request: Request):
+    require(request)
+    path = INVENTORY_PATH
+    result = {'inventory': {'exists': path.is_file(), 'readable': False, 'message': ''},
+              'storage_configured': bool(get('pcloud_token')),
+              'source_count': len(available_sources()),
+              'backup_busy': LOCK.locked()}
+    try:
+        if path.is_file():
+            result['inventory']['readable'] = os.access(path, os.R_OK)
+            result['inventory']['size_bytes'] = path.stat().st_size
+        discovered = read_docker_inventory()
+        result['inventory'].update({'ready': discovered['ready'], 'stale': discovered['stale'],
+                                    'generated_at': discovered.get('generated_at'), 'message': discovered['message']})
+    except OSError:
+        result['inventory']['message'] = 'No se puede acceder al archivo de inventario'
+    return result
 
 
 def cipher():
@@ -151,6 +238,7 @@ def setup(body: Credentials, request: Request):
         except sqlite3.IntegrityError:
             raise HTTPException(409, 'La cuenta inicial ya fue creada')
     put('restic_password', secrets.token_urlsafe(48), secret=True)
+    event('INFO','security','Cuenta administradora inicial creada')
     return {'ok': True}
 
 
@@ -166,6 +254,7 @@ def login(body: Credentials):
         c.execute('INSERT INTO sessions VALUES (?,?,?)', (hashlib.sha256(token.encode()).hexdigest(), csrf, int(time.time()) + SESSION_SECONDS))
     response = JSONResponse({'ok': True, 'csrf': csrf})
     response.set_cookie('cbm_session', token, max_age=SESSION_SECONDS, httponly=True, secure=os.environ.get('CBM_ALLOW_HTTP') != '1', samesite='strict', path='/')
+    event('INFO','security','Inicio de sesión correcto')
     return response
 
 
@@ -276,6 +365,7 @@ def select_sources(body: Selection, request: Request):
     if not body.paths or any(x not in possible for x in body.paths):
         raise HTTPException(422, 'Selecciona carpetas autorizadas de /sources')
     put('selected', json.dumps(sorted(set(body.paths))))
+    event('INFO','sources',f'Selección de orígenes actualizada: {len(body.paths)} carpetas')
     return {'ok': True}
 
 
@@ -312,6 +402,7 @@ def storage(body: Storage, request: Request):
     put('pcloud_token', json.dumps(obj), secret=True)
     put('region', body.region)
     put('folder', folder)
+    event('INFO','pcloud','Configuración de almacenamiento actualizada')
     return {'ok': True}
 
 
@@ -319,6 +410,7 @@ def storage(body: Storage, request: Request):
 def schedule(body: Schedule, request: Request):
     require(request, True)
     put('schedule', body.model_dump_json())
+    event('INFO','schedule','Programación actualizada')
     return {'ok': True}
 
 
@@ -346,6 +438,7 @@ def perform(operation, snapshot=None):
         raise RuntimeError('Ya se está ejecutando una operación')
     with db() as c:
         job = c.execute('INSERT INTO runs(operation,status,started) VALUES (?,?,?)', (operation, 'running', now())).lastrowid
+    event('INFO','backup', f'Trabajo iniciado: {operation}, ID {job}')
     try:
         if operation == 'test':
             p = command('rclone', 'lsd', 'pcloud:', timeout=90)
@@ -386,9 +479,11 @@ def perform(operation, snapshot=None):
             detail = 'Completado' if operation != 'restore' else f'Recuperado en {target} (sin sobrescribir origen)'
         with db() as c:
             c.execute('UPDATE runs SET status=?, finished=?, detail=? WHERE id=?', ('success', now(), detail, job))
+        event('INFO','backup', f'Trabajo {job} ({operation}) completado')
     except Exception as exc:
         with db() as c:
-            c.execute('UPDATE runs SET status=?, finished=?, detail=? WHERE id=?', ('error', now(), str(exc)[:1800], job))
+            c.execute('UPDATE runs SET status=?, finished=?, detail=? WHERE id=?', ('error', now(), safe_message(exc), job))
+        event('ERROR','backup', f'Trabajo {job} ({operation}) falló: {safe_message(exc)}')
     finally:
         LOCK.release()
 
@@ -437,12 +532,13 @@ def scheduler_loop():
                     and get('last_schedule_date') != date_key and not LOCK.locked()):
                 put('last_schedule_date', date_key)
                 threading.Thread(target=perform, args=('backup',), daemon=True).start()
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.error('Error del programador: %s', type(exc).__name__)
         time.sleep(20)
 
 
 @app.on_event('startup')
 def startup():
     init()
+    event('INFO','app','Copier Backup Manager iniciado')
     threading.Thread(target=scheduler_loop, daemon=True).start()

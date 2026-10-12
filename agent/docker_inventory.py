@@ -8,6 +8,7 @@ No exporta variables de entorno, secretos ni contenido de archivos.
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -15,6 +16,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+LOG = logging.getLogger('cbm-agent')
 TIMEOUT_SECONDS = 45
 MAX_OBJECTS = 2000
 
@@ -179,16 +182,17 @@ def main():
     parser = argparse.ArgumentParser(description="Inventario Docker de solo consulta")
     parser.add_argument("--output", required=True, help="Archivo JSON de salida")
     args = parser.parse_args()
+    LOG.info('Iniciando inventario Docker')
     try:
         data = inventory()
         atomic_save(Path(args.output).expanduser(), data)
     except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        LOG.error('No se pudo generar el inventario (%s). Verificar Docker y permisos.', type(exc).__name__)
         return 1
-    print("Inventario generado:", args.output)
-    print("Contenedores:", len(data["containers"]))
-    print("Proyectos Compose:", len(data["compose_projects"]))
-    print("Volúmenes:", len(data["volumes"]))
+    LOG.info('Inventario publicado correctamente')
+    LOG.info('Contenedores: %s', len(data['containers']))
+    LOG.info('Proyectos Compose: %s', len(data['compose_projects']))
+    LOG.info('Volúmenes: %s', len(data['volumes']))
     return 0
 
 
