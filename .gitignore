@@ -1,0 +1,10 @@
+.env
+*.key
+*.sqlite3
+__pycache__/
+.pytest_cache/
+.venv/
+rclone.conf
+data/
+restored/
+*.log

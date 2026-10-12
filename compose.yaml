@@ -1,0 +1,27 @@
+services:
+  backup-manager:
+    build: .
+    restart: unless-stopped
+    environment:
+      TZ: America/Lima
+    volumes:
+      - cbm_data:/data
+      - cbm_restores:/data/restored
+      - ./sample-data:/sources/demo:ro
+    expose:
+      - "8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/bootstrap', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+volumes:
+  cbm_data:
+  cbm_restores:
